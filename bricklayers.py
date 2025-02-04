@@ -11,10 +11,9 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
-# Copyright (c) [2025] [Roman Tenger]
-from pickle import FALSE
+# Original implementation by Roman Tenger
+
 import re
-import sys
 import logging
 import os
 import argparse
@@ -99,20 +98,17 @@ class LineSegment:
 
 
 class Object:
-        def __init__(self, nozzle_diameter, x=0, y=0):
+        def __init__(self, nozzle_diameter, x=0, y=0, z=0, height=0):
             self.layer_num = -1
             self.has_top = [False]
             self.has_overhangs = [False]
-            self.external_perimeters = []
+            self.external_perimeters = [[]]
             self.nozzle_diameter = nozzle_diameter
             self.x = x
             self.y = y
-            self.layer_height = []
-            self.layer_z = []
+            self.layer_height = [height]
+            self.layer_z = [z]
             self.perimeter_width = nozzle_diameter * 1.125
-            self.perimeter_width_sum = 0
-            self.perimeter_length = 0
-            self.average_perimeter_width = []
 
         def update_coordinates(self, x, y):
             self.x = x
@@ -121,24 +117,21 @@ class Object:
         def update_perimeter_width(self, perimeter_width):
             self.perimeter_width = perimeter_width
 
-        def new_layer(self, x, y):
+        def new_layer(self, x, y, z, layer_height):
             self.has_top.append(False)
             self.has_overhangs.append(False)
             self.external_perimeters.append([])
             self.update_coordinates(x, y)
-            self.average_perimeter_width.append(self.perimeter_width_sum / self.perimeter_length)
+            self.layer_height.append(layer_height)
+            self.layer_z.append(z)
+
 
         def add_external_perimeter_line(self, x, y):
-            self.external_perimeters.append(LineSegment(self.x, self.y, x, y))
+            self.external_perimeters[-1].append(LineSegment(self.x, self.y, x, y))
             self.update_coordinates(x, y)
 
-        def add_internal_perimeter_line(self, x, y):
-            l = math.sqrt((self.x - x) ** 2 + (self.y - y) ** 2)
-            self.perimeter_width_sum += self.perimeter_width * l
-            self.perimeter_length += l
 
-
-def process_gcode(input_file, layer_height, extrusion_multiplier):
+def process_gcode(input_file, extrusion_multiplier):
     # Lists per perimeter type
     external_perimeter = ["External perimeter", "Outer wall"]
     internal_perimeter = ["Perimeter", "Inner wall", "Internal perimeter"]
@@ -160,13 +153,17 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
     logging.info(f"Z-shift: {z_shift} mm, Layer height: {layer_height} mm")
 
     objects = {}
-    current_object = ""
+    current_object = "Start G-code"
     current_x = 0
     current_y = 0
+    current_layer_z = 0
+    current_layer_height = 0
     previous_x = 0
     previous_y = 0
     perimeter_spacing = 0.4
     perimeter_contour = []
+
+    objects[current_object] = Object(current_x, current_y)
 
     # Read the input G-code
     with open(input_file, 'r') as infile:
@@ -175,7 +172,7 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
     # Preprocess
     for line in lines:
         # Get perimeter type
-        match = re.search(r";TYPE:([^n]*)", line)
+        match = re.search(r";TYPE:([^\n]*)", line)
         if match:
             if match.group(1) in external_perimeter:
                 perimeter_type = EXTERNAL_PERIMETER
@@ -184,14 +181,9 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
             elif match.group(1) in top_solid:
                 objects[current_object].has_top[-1] = True
             elif match.group(1) in overhang_perimeter:
-                objects[current_object].has_overhang[-1] = True
+                objects[current_object].has_overhangs[-1] = True
             else:
                 perimeter_type = OTHER
-
-        # Get line width from comments
-        match = re.search(r";WIDTH:([\.\d]+)", line)
-        if match:
-            objects[current_object].update_perimeter_width(float(match.group(1)))
 
         # Get X coordinate from G1 move
         match = re.search(r"G1 [^X\n]*X([-\d\.]+)", line)
@@ -206,10 +198,11 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
         # Get Z values
         match = re.search(r";Z:([\.\d]+)", line)
         if match:
-            objects[current_object].layer_z.append(float(match.group(1)))
+            current_layer_z = float(match.group(1))
+
         match = re.search(r";HEIGHT:([\.\d]+)", line)
         if match:
-            objects[current_object].layer_height.append(float(match.group(1)))
+            current_layer_height = float(match.group(1))
 
         # Add a line segment if an external perimeter is being extruded
         match = re.search(r"G1 ([^XY]*(X|Y))+[^E]*E[^-]", line)
@@ -218,25 +211,26 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
                 objects[current_object].add_external_perimeter_line(current_x, current_y)
 
         # Find the boundary of an object, all data is stored per object
-        match = re.search(r";printing object ([^\n]*)", line)
+        match = re.search(r"; printing object ([^\n]*)", line)
         if match:
             current_object = match.group(1)
-            if current_object in objects.keys:
-                objects[current_object].new_layer(current_x, current_y)
+            if current_object in list(objects):
+                objects[current_object].new_layer(current_x, current_y, current_layer_z, current_layer_height)
             else:
-                objects[current_object] = Object(current_x, current_y)
+                objects[current_object] = Object(current_x, current_y, current_layer_z, current_layer_height)
 
     # Process the G-code
     modified_lines = []
     for line in lines:
         # Detect current object
         # Currently supports only OctoPrint comments
-        match = re.search(r";printing object ([^\n]*)", line)
+        match = re.search(r"; printing object ([^\n]*)", line)
         if match:
             current_object = match.group(1)
             objects[current_object].layer_num += 1
             layer_num = objects[current_object].layer_num
             layer_z = objects[current_object].layer_z[layer_num]
+            layer_height = objects[current_object].layer_height[layer_num]
             logging.info(f"Layer {layer_num} detected at Z={layer_z:.3f}")
             modified_lines.append(line)
             perimeter_contour = []
@@ -262,42 +256,49 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
             continue
 
         # Detect perimeter types from G-code comments
-        match = re.search(r";TYPE:([^n]*)", line)
+        match = re.search(r";TYPE:([^\n]*)", line)
         if match:
             if match.group(1) in external_perimeter:
                 perimeter_type = EXTERNAL_PERIMETER
                 logging.info(f"External perimeter detected at layer {layer_num}")
+                modified_lines.extend(perimeter_contour)
+                inside_perimeter_contour = False
+                perimeter_contour = []
                 modified_lines.append(f"G1 Z{layer_z:.3f}\n")
-            elif match.group(1) in  internal_perimeter:
+            elif match.group(1) in internal_perimeter:
                 perimeter_type = INTERNAL_PERIMETER
-                logging.info(f"Internal perimeter contour started at layer {layer_num}")
+                logging.info(f"Internal perimeter detected at layer {layer_num}")
             else:
                 perimeter_type = OTHER
+                modified_lines.extend(perimeter_contour)
+                inside_perimeter_contour = False
+                perimeter_contour = []
             modified_lines.append(line)
             continue
 
         if perimeter_type == INTERNAL_PERIMETER:
             # End of perimeter contour
-            if line.startswith("G1") and 'X' in line and 'Y' in line and 'F' in line:
+            if line.startswith("G1") and ('X' in line or 'Y' in line) and 'F' in line:
                 # Evaluate stored commands if stored
                 if len(perimeter_contour) > 0:
                     # Find distance to closest external perimeter
                     min_distances = []
                     for perimeter_segment in perimeter_contour:
-                        if 'X' in perimeter_segment or 'Y' in perimeter_segment:
-                            match = re.search(r"X([-\d\.])+", perimeter_segment)
+                        #x, y = contour_start
+                        if perimeter_segment.startswith("G1") and ('X' in perimeter_segment or 'Y' in perimeter_segment):
+                            match = re.search(r"X([-\d\.]+)", perimeter_segment)
                             if match:
                                 x = float(match.group(1))
                 
-                            match = re.search(r"Y([-\d\.])+", perimeter_segment)
+                            match = re.search(r"Y([-\d\.]+)", perimeter_segment)
                             if match:
                                 y = float(match.group(1))
                         
-                        min_distances.append(float("inf"))
-                        for external_perimeter_segment in objects[current_object].external_perimeters[layer_num]:
-                            min_distances[-1] = min(min_distances[-1], external_perimeter_segment.distance(*contour_start, x, y))
+                            min_distances.append(float("inf"))
+                            for external_perimeter_segment in objects[current_object].external_perimeters[layer_num]:
+                                min_distances[-1] = min(min_distances[-1], external_perimeter_segment.distance(*contour_start, x, y))
         
-                        contour_start = x, y
+                            contour_start = x, y
         
                     index_count = [[0, 0]]
                     for min_distance in min_distances:
@@ -313,10 +314,20 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
                     index = index_count[0][0]
                     # if odd, shift down
                     if index % 2 == 1:
+                        logging.info(f"Shifted perimeter contour detected at layer {layer_num}")
                         shifted_layer_z = layer_z - 0.5 * layer_height
                         modified_lines.append(f"G1 Z{shifted_layer_z:.3f}\n")
-                        modified_lines.extend(perimeter_contour) # TODO: modify E values based on widths and heights
+                        for perimeter_segment in perimeter_contour:
+                            match = re.search(r"Z([\d\.]+)", perimeter_segment)
+                            if match:
+                                z = float(match.group(1)) - 0.5 * layer_height
+                                perimeter_segment = re.sub(r"Z([\d\.]+)", f"Z{z:.3f}", perimeter_segment)
+                            modified_lines.append(perimeter_segment)
+                        # TODO: modify E values based on widths and heights
                         modified_lines.append(f"G1 Z{layer_z:.3f}\n")
+                    else:
+                        modified_lines.append(f"G1 Z{layer_z:.3f}\n")
+                        modified_lines.extend(perimeter_contour)
                 # Reset/clear all data relating to the previous contour (if any)
                 inside_perimeter_contour = False
                 modified_lines.append(line)
@@ -342,12 +353,10 @@ def process_gcode(input_file, layer_height, extrusion_multiplier):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Post-process G-code for Z-shifting and extrusion adjustments.")
     parser.add_argument("input_file", help="Path to the input G-code file")
-    parser.add_argument("-layerHeight", type=float, default=0.2, help="Layer height in mm (default: 0.2mm)")
     parser.add_argument("-extrusionMultiplier", type=float, default=1, help="Extrusion multiplier for first layer (default: 1.5x)")
     args = parser.parse_args()
 
     process_gcode(
         input_file=args.input_file,
-        layer_height=args.layerHeight,
         extrusion_multiplier=args.extrusionMultiplier,
     )
